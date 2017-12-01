@@ -24,7 +24,7 @@ public class PluginApplication extends Application {
 
     LeakCanary.install(this);
     initializeLogger();
-    Mapbox.getInstance(this, getString(R.string.mapbox_access_token));
+    Mapbox.getInstance(this, "pk.eyJ1IjoiZXRpZW5uZS1tYXB3aXplIiwiYSI6ImNpaWszNWF2dDAxYjF1aWtwYTI5bmQxam4ifQ.7GdfVuicspgzILBdynB2qQ");
     Timber.plant(new Timber.DebugTree());
   }
 

@@ -243,8 +243,8 @@ public class LocationLayerPlugin implements LocationEngineListener, CompassListe
   @OnLifecycleEvent(Lifecycle.Event.ON_STOP)
   public void onStop() {
     stopAllAnimations();
-    if (compassManager != null && compassManager.isSensorAvailable()) {
-      compassManager.onStop();
+    if (compassManager != null) {
+      compassManager.stop();
     }
     if (locationEngine != null) {
       locationEngine.removeLocationEngineListener(this);
@@ -266,8 +266,8 @@ public class LocationLayerPlugin implements LocationEngineListener, CompassListe
     }
 
     if (compassManager.getCompassListeners().size() > 0
-      || locationLayerMode == LocationLayerMode.COMPASS && compassManager.isSensorAvailable()) {
-      compassManager.onStart();
+      || locationLayerMode == LocationLayerMode.COMPASS) {
+      compassManager.start();
     }
   }
 
@@ -303,7 +303,7 @@ public class LocationLayerPlugin implements LocationEngineListener, CompassListe
    */
   public void addCompassListener(@NonNull CompassListener compassListener) {
     compassManager.addCompassListener(compassListener);
-    compassManager.onStart();
+    compassManager.start();
   }
 
   /**
@@ -313,9 +313,9 @@ public class LocationLayerPlugin implements LocationEngineListener, CompassListe
    *                        list. You can optionally pass in null to remove all listeners
    */
   public void removeCompassListener(@Nullable CompassListener compassListener) {
-    compassManager.removeCompassListener(compassListener);
+    compassManager.unregisterCompassListener(compassListener);
     if (compassManager.getCompassListeners().size() < 1) {
-      compassManager.onStop();
+      compassManager.stop();
     }
   }
 
@@ -421,10 +421,10 @@ public class LocationLayerPlugin implements LocationEngineListener, CompassListe
   private void setMyBearingEnabled(boolean bearingEnabled) {
     toggleBearingLayerVisibility(bearingEnabled);
     if (bearingEnabled) {
-      compassManager.onStart();
+      compassManager.start();
     } else {
       if (compassManager != null && compassManager.getCompassListeners().size() < 1) {
-        compassManager.onStop();
+        compassManager.stop();
       }
     }
   }
@@ -539,8 +539,10 @@ public class LocationLayerPlugin implements LocationEngineListener, CompassListe
     }
 
     locationChangeAnimator = ValueAnimator.ofObject(new Utils.PointEvaluator(), currentSourcePoint, newPoint);
-    locationChangeAnimator.setDuration(linearAnimation ? getLocationUpdateDuration()
-      : LocationLayerConstants.LOCATION_UPDATE_DELAY_MS);
+    // TODO Uncomment when accuracy is drawn with cirle to avoid animated point and unanimated accuracy
+    /*locationChangeAnimator.setDuration(linearAnimation ? getLocationUpdateDuration()
+      : LocationLayerConstants.LOCATION_UPDATE_DELAY_MS);*/
+    locationChangeAnimator.setDuration(0);
     if (linearAnimation) {
       locationChangeAnimator.setInterpolator(new LinearInterpolator());
     } else {
@@ -578,7 +580,7 @@ public class LocationLayerPlugin implements LocationEngineListener, CompassListe
     }
 
     bearingChangeAnimator = ValueAnimator.ofFloat(previousMagneticHeading, magneticHeading);
-    bearingChangeAnimator.setDuration(LocationLayerConstants.COMPASS_UPDATE_RATE_MS);
+    bearingChangeAnimator.setDuration(0);
     bearingChangeAnimator.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
       @Override
       public void onAnimationUpdate(ValueAnimator valueAnimator) {

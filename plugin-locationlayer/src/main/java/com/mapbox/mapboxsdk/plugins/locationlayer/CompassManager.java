@@ -1,13 +1,19 @@
 package com.mapbox.mapboxsdk.plugins.locationlayer;
 
 import android.content.Context;
+import android.hardware.GeomagneticField;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.os.Bundle;
 import android.os.SystemClock;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
+import android.util.Log;
 import android.view.Surface;
 import android.view.WindowManager;
 
@@ -22,156 +28,336 @@ import timber.log.Timber;
  *
  * @since 0.1.0
  */
-class CompassManager implements SensorEventListener {
+class CompassManager implements SensorEventListener, LocationListener {
 
-  // The rate sensor events will be delivered at. As the Android documentation states,
-  // this is only a hint to the system and the events might actually be received faster
-  // or slower then this specified rate. Since the minimum Android API levels about 9,
-  // we are able to set this value ourselves rather than using one of the provided
-  // constants which deliver updates too quickly for our use case.
-  private static final int SENSOR_DELAY_MICROS = 100 * 1000; // 100ms
+  public static final String TAG = "BearingToNorthProvider";
 
-  private final WindowManager windowManager;
-  private final SensorManager sensorManager;
-  private CompassListener internalCompassListener;
-  private List<CompassListener> compassListeners;
+  private final SensorManager mSensorManager;
+  private final LocationManager mLocationManager;
+  private final Sensor mSensorAccelerometer;
+  private final Sensor mSensorMagneticField;
 
-  // Not all devices have a compassSensor
-  @Nullable
-  private Sensor compassSensor;
+  // some arrays holding intermediate values read from the sensors, used to calculate our azimuth
+  // value
 
-  private int lastAccuracy;
-
-  // CompassManager data
-  private long compassUpdateNextTimestamp = 0;
+  private float[] mValuesAccelerometer;
+  private float[] mValuesMagneticField;
+  private float[] mMatrixR;
+  private float[] mMatrixI;
+  private float[] mMatrixValues;
 
   /**
-   * Construct a new instance of the this class. A internal compass listeners needed to separate it
-   * from the cleared list of public listeners.
+   * minimum change of bearing (degrees) to notify the change listener
    */
-  CompassManager(Context context, CompassListener internalCompassListener) {
-    this.internalCompassListener = internalCompassListener;
-    compassListeners = new ArrayList<>();
+  private final double mMinDiffForEvent;
 
-    windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
-    sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
+  /**
+   * minimum delay (millis) between notifications for the change listener
+   */
+  private final double mThrottleTime;
 
-    compassSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
-    if (compassSensor == null) {
-      Timber.d("Rotation vector sensor not supported on device, falling back to orientation.");
-      compassSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ORIENTATION);
-    }
+  /**
+   * the change event listener
+   */
+  private CompassListener mCompassListener;
+
+  private List<CompassListener> mCompassListeners;
+
+  /**
+   * angle to magnetic north
+   */
+  private AverageAngle mAzimuthRadians;
+
+  /**
+   * smoothed angle to magnetic north
+   */
+  private double mAzimuth = Double.NaN;
+
+  /**
+   * angle to true north
+   */
+  private double mBearing = Double.NaN;
+
+  /**
+   * last notified angle to true north
+   */
+  private double mLastBearing = Double.NaN;
+
+  /**
+   * Current GPS/WiFi location
+   */
+  private Location mLocation;
+
+  /**
+   * when we last dispatched the change event
+   */
+  private long mLastChangeDispatchedAt = -1;
+
+  /**
+   * Default constructor.
+   *
+   * @param context Application Context
+   */
+  public CompassManager(Context context, CompassListener compassListener) {
+    this(context, compassListener, 50, 1, 50);
   }
 
-  void addCompassListener(@NonNull CompassListener compassListener) {
-    compassListeners.add(compassListener);
+  /**
+   * @param context Application Context
+   * @param smoothing the number of measurements used to calculate a mean for the azimuth. Set
+   *                      this to 1 for the smallest delay. Setting it to 5-10 to prevents the
+   *                      needle from going crazy
+   * @param minDiffForEvent minimum change of bearing (degrees) to notify the change listener
+   * @param throttleTime minimum delay (millis) between notifications for the change listener
+   */
+  public CompassManager(Context context, CompassListener compassListener, int smoothing, double minDiffForEvent, int throttleTime)
+  {
+    mCompassListeners = new ArrayList<>();
+    mCompassListener = compassListener;
+
+    mSensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
+    mSensorAccelerometer = mSensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+    mLocationManager = (LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
+    mSensorMagneticField = mSensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
+
+    mValuesAccelerometer = new float[3];
+    mValuesMagneticField = new float[3];
+
+    mMatrixR = new float[9];
+    mMatrixI = new float[9];
+    mMatrixValues = new float[3];
+
+    mMinDiffForEvent = minDiffForEvent;
+    mThrottleTime = throttleTime;
+
+    mAzimuthRadians = new AverageAngle(smoothing);
   }
 
-  void removeCompassListener(@Nullable CompassListener compassListener) {
-    if (compassListener == null) {
-      compassListeners.clear();
-      return;
-    }
-    compassListeners.remove(compassListener);
-  }
+  //==============================================================================================
+  // Public API
+  //==============================================================================================
 
-  List<CompassListener> getCompassListeners() {
-    return compassListeners;
-  }
+  /**
+   * Call this method to start bearing updates.
+   */
+  public void start()
+  {
+    mSensorManager.registerListener(this, mSensorAccelerometer, SensorManager.SENSOR_DELAY_UI);
+    mSensorManager.registerListener(this, mSensorMagneticField, SensorManager.SENSOR_DELAY_UI);
 
-  void onStart() {
-    // Does nothing if the sensors already registered.
-    sensorManager.registerListener(this, compassSensor, SENSOR_DELAY_MICROS);
-  }
-
-  void onStop() {
-    sensorManager.unregisterListener(this, compassSensor);
-  }
-
-  boolean isSensorAvailable() {
-    return compassSensor != null;
-  }
-
-  @Override
-  public void onSensorChanged(SensorEvent event) {
-    if (internalCompassListener == null) {
-      return;
-    }
-    // check when the last time the compass was updated, return if too soon.
-    long currentTime = SystemClock.elapsedRealtime();
-    if (currentTime < compassUpdateNextTimestamp) {
-      return;
-    }
-    if (lastAccuracy == SensorManager.SENSOR_STATUS_UNRELIABLE) {
-      Timber.d("Compass sensor is unreliable, device calibration is needed.");
-      return;
-    }
-    if (event.sensor.getType() == Sensor.TYPE_ROTATION_VECTOR) {
-      updateOrientation(event.values);
-
-      // Update the compassUpdateNextTimestamp
-      compassUpdateNextTimestamp = currentTime + LocationLayerConstants.COMPASS_UPDATE_RATE_MS;
-    } else if (event.sensor.getType() == Sensor.TYPE_ORIENTATION) {
-      internalCompassListener.onCompassChanged((event.values[0] + 360) % 360);
-      for (CompassListener compassListener : compassListeners) {
-        compassListener.onCompassChanged((event.values[0] + 360) % 360);
+    for (final String provider : mLocationManager.getProviders(true)) {
+      if (LocationManager.GPS_PROVIDER.equals(provider)
+              || LocationManager.PASSIVE_PROVIDER.equals(provider)
+              || LocationManager.NETWORK_PROVIDER.equals(provider)) {
+        if (mLocation == null) {
+          mLocation = mLocationManager.getLastKnownLocation(provider);
+        }
+        mLocationManager.requestLocationUpdates(provider, 0, 100.0f, this);
       }
     }
   }
 
+  /**
+   * call this method to stop bearing updates.
+   */
+  public void stop()
+  {
+    mSensorManager.unregisterListener(this, mSensorAccelerometer);
+    mSensorManager.unregisterListener(this, mSensorMagneticField);
+    mLocationManager.removeUpdates(this);
+  }
+
+  /**
+   * @return current bearing
+   */
+  public double getBearing()
+  {
+    return mBearing;
+  }
+
+  /**
+   * Returns the bearing event listener to which bearing events must be sent.
+   * @return the bearing event listener
+   */
+  public List<CompassListener> getCompassListeners()
+  {
+    return mCompassListeners;
+  }
+
+  /**
+   * Specifies the bearing event listener to which bearing events must be sent.
+   * @param compassListener the bearing event listener
+   */
+  public void setCompassListener(CompassListener compassListener)
+  {
+    this.mCompassListener = compassListener;
+  }
+
+  /**
+   * Specifies the bearing event listener to which bearing events must be sent.
+   * @param compassListener the bearing event listener
+   */
+  public void addCompassListener(CompassListener compassListener)
+  {
+    this.mCompassListeners.add(compassListener);
+  }
+
+  public void unregisterCompassListener(CompassListener compassListener) {
+    this.mCompassListeners.remove(compassListener);
+  }
+
+  //==============================================================================================
+  // SensorEventListener implementation
+  //==============================================================================================
+
   @Override
-  public void onAccuracyChanged(Sensor sensor, int accuracy) {
-    if (lastAccuracy != accuracy) {
-      internalCompassListener.onCompassAccuracyChange(accuracy);
-      for (CompassListener compassListener : compassListeners) {
-        compassListener.onCompassAccuracyChange(accuracy);
+  public void onSensorChanged(SensorEvent event)
+  {
+    switch (event.sensor.getType()) {
+      case Sensor.TYPE_ACCELEROMETER:
+        System.arraycopy(event.values, 0, mValuesAccelerometer, 0, 3);
+        break;
+      case Sensor.TYPE_MAGNETIC_FIELD:
+        System.arraycopy(event.values, 0, mValuesMagneticField, 0, 3);
+        break;
+    }
+
+    boolean success = SensorManager.getRotationMatrix(mMatrixR, mMatrixI,
+            mValuesAccelerometer,
+            mValuesMagneticField);
+
+    // calculate a new smoothed azimuth value and store to mAzimuth
+    if (success) {
+      SensorManager.getOrientation(mMatrixR, mMatrixValues);
+      mAzimuthRadians.putValue(mMatrixValues[0]);
+      mAzimuth = Math.toDegrees(mAzimuthRadians.getAverage());
+    }
+
+    // update mBearing
+    updateBearing();
+  }
+
+  @Override
+  public void onAccuracyChanged(Sensor sensor, int i) {   }
+
+  //==============================================================================================
+  // LocationListener implementation
+  //==============================================================================================
+
+  @Override
+  public void onLocationChanged(Location location)
+  {
+    // set the new location
+    this.mLocation = location;
+
+    // update mBearing
+    updateBearing();
+  }
+
+  @Override
+  public void onStatusChanged(String s, int i, Bundle bundle) {   }
+
+  @Override
+  public void onProviderEnabled(String s) {   }
+
+  @Override
+  public void onProviderDisabled(String s) {   }
+
+  //==============================================================================================
+  // Private Utilities
+  //==============================================================================================
+
+  private void updateBearing()
+  {
+    if (!Double.isNaN(this.mAzimuth)) {
+      if(this.mLocation == null) {
+        Log.w(TAG, "Location is NULL bearing is not true north!");
+        mBearing = mAzimuth;
+      } else {
+        mBearing = getBearingForLocation(this.mLocation);
       }
-      lastAccuracy = accuracy;
+
+      // Throttle dispatching based on mThrottleTime and minDiffForEvent
+      if( System.currentTimeMillis() - mLastChangeDispatchedAt > mThrottleTime &&
+              (Double.isNaN(mLastBearing) || Math.abs(mLastBearing - mBearing) >= mMinDiffForEvent)) {
+        mLastBearing = mBearing;
+        if(mCompassListener != null) {
+          mCompassListener.onCompassChanged((float)mBearing);
+        }
+        mLastChangeDispatchedAt = System.currentTimeMillis();
+      }
     }
   }
 
-  @SuppressWarnings("SuspiciousNameCombination")
-  private void updateOrientation(float[] rotationVector) {
-    float[] rotationMatrix = new float[9];
-    SensorManager.getRotationMatrixFromVector(rotationMatrix, rotationVector);
+  private double getBearingForLocation(Location location)
+  {
+    return mAzimuth + getGeomagneticField(location).getDeclination();
+  }
 
-    final int worldAxisForDeviceAxisX;
-    final int worldAxisForDeviceAxisY;
+  private GeomagneticField getGeomagneticField(Location location)
+  {
+    GeomagneticField geomagneticField = new GeomagneticField(
+            (float)location.getLatitude(),
+            (float)location.getLongitude(),
+            (float)location.getAltitude(),
+            System.currentTimeMillis());
+    return geomagneticField;
+  }
 
-    // Remap the axes as if the device screen was the instrument panel,
-    // and adjust the rotation matrix for the device orientation.
-    switch (windowManager.getDefaultDisplay().getRotation()) {
-      case Surface.ROTATION_0:
-      default:
-        worldAxisForDeviceAxisX = SensorManager.AXIS_X;
-        worldAxisForDeviceAxisY = SensorManager.AXIS_Z;
-        break;
-      case Surface.ROTATION_90:
-        worldAxisForDeviceAxisX = SensorManager.AXIS_Z;
-        worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_X;
-        break;
-      case Surface.ROTATION_180:
-        worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_X;
-        worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_Z;
-        break;
-      case Surface.ROTATION_270:
-        worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_Z;
-        worldAxisForDeviceAxisY = SensorManager.AXIS_X;
-        break;
+  public class AverageAngle
+  {
+    private double[] mValues;
+    private int mCurrentIndex;
+    private int mNumberOfFrames;
+    private boolean mIsFull;
+    private double mAverageValue = Double.NaN;
+
+    public AverageAngle(int frames)
+    {
+      this.mNumberOfFrames = frames;
+      this.mCurrentIndex = 0;
+      this.mValues = new double[frames];
     }
 
-    float[] adjustedRotationMatrix = new float[9];
-    SensorManager.remapCoordinateSystem(rotationMatrix, worldAxisForDeviceAxisX,
-      worldAxisForDeviceAxisY, adjustedRotationMatrix);
+    public void putValue(double d)
+    {
+      mValues[mCurrentIndex] = d;
+      if (mCurrentIndex == mNumberOfFrames - 1) {
+        mCurrentIndex = 0;
+        mIsFull = true;
+      } else {
+        mCurrentIndex++;
+      }
+      updateAverageValue();
+    }
 
-    // Transform rotation matrix into azimuth/pitch/roll
-    float[] orientation = new float[3];
-    SensorManager.getOrientation(adjustedRotationMatrix, orientation);
+    public double getAverage()
+    {
+      return this.mAverageValue;
+    }
 
-    // The x-axis is all we care about here.
-    internalCompassListener.onCompassChanged((float) Math.toDegrees(orientation[0]));
-    for (CompassListener compassListener : compassListeners) {
-      compassListener.onCompassChanged((float) Math.toDegrees(orientation[0]));
+    private void updateAverageValue()
+    {
+      int numberOfElementsToConsider = mNumberOfFrames;
+      if (!mIsFull) {
+        numberOfElementsToConsider = mCurrentIndex + 1;
+      }
+
+      if (numberOfElementsToConsider == 1) {
+        this.mAverageValue = mValues[0];
+        return;
+      }
+
+      // Formula: http://en.wikipedia.org/wiki/Circular_mean
+      double sumSin = 0.0;
+      double sumCos = 0.0;
+      for (int i = 0; i < numberOfElementsToConsider; i++) {
+        double v = mValues[i];
+        sumSin += Math.sin(v);
+        sumCos += Math.cos(v);
+      }
+      this.mAverageValue = Math.atan2(sumSin, sumCos);
     }
   }
+
 }
